@@ -1,21 +1,21 @@
 # -- Web framework -----------------------------------------
 fastapi>=0.110.0
 uvicorn[standard]>=0.29.0
-python-multipart>=0.0.9
-
+starlette>=1.0.1            # explicit pin: CVE-2026-48710 (BadHost) host-header auth bypass, Critical
+python-multipart>=0.0.32    # CVE-2026-53537/53538/53540 - DoS via malformed/oversized requests, High
 # -- Image processing --------------------------------------
-Pillow>=10.0.0
+Pillow>=12.2.0               # CVE-2026-42311/42309 - PSD/coord memory corruption, Critical
 opencv-python>=4.9.0
 numpy>=1.24.0
-
 # -- MediaPipe (background removal in liveness stage) ------
-mediapipe==0.10.9
-
+mediapipe>=0.10.21,<0.11     # patched minor release; pin <0.11 to stay on the 0.10.x API surface you tested against
 # -- Deep learning (CPU only) ------------------------------
-
-torch==2.3.0
-torchvision==0.18.0
-transformers==4.44.0
-accelerate==0.33.0
-onnxruntime>=1.17
-optimum[onnxruntime]>=1.17
+# torch and torchvision are installed separately from the PyTorch CPU index -
+# see requirements-torch-cpu.txt / install instructions below.
+# DO NOT add torch/torchvision here - installing them from plain PyPI pulls
+# the full CUDA build (~3GB of nvidia-* packages) even on a CPU-only box.
+transformers>=5.3.0          # CVE-2026-4372 - config-driven RCE bypassing trust_remote_code, High
+                              # NOTE: this is a 4.x -> 5.x major bump, see message for breaking-change/optimum caveat
+accelerate>=1.0.0            # transformers 5.x requires a modern accelerate; 0.33.0 will not import
+onnxruntime>=1.20.1          # heap OOB read / integer truncation fixes, Medium
+optimum>=2.0.0               # NOTE: dropped the [onnxruntime] extra here - see message below

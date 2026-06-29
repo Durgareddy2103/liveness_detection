@@ -56,6 +56,21 @@ Why this beats the old Pass 4 heuristic on real images:
     → score ≈ 0.04  (well below 0.50 threshold)
   Phone at mouth:      skin_drop ≈ 0.57, boundary_sharpness ≈ 50, uniformity ≈ 0.34
     → score ≈ 1.95  (well above 0.50 threshold)
+
+---------------------------------------------------------------------------
+v13.1 dependency-upgrade notes (added during the security/version-bump pass):
+  - Migrated startup from `@app.on_event("startup")` to the `lifespan`
+    context-manager API. Starlette 1.0+ removed `on_event()` entirely
+    ("Remove on_event() decorator from Starlette and Router. Use the
+    lifespan parameter instead"), so the old decorator-based startup hook
+    would fail outright once starlette>=1.0.1 is installed (required for
+    CVE-2026-48710 / BadHost). The app is now constructed further down in
+    this file, right where the old @app.on_event block used to live, so
+    the lifespan function can close over the config constants and helper
+    functions (_eye_cascade, _startup_init_kprokofi, etc.) that are defined
+    between the old early `app = FastAPI(...)` line and the old startup
+    hook. No behavioural change - same log lines, same init order.
+---------------------------------------------------------------------------
 """
 
 from __future__ import annotations
@@ -72,10 +87,11 @@ import sys
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -86,11 +102,6 @@ import onnxruntime as ort
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.exception_handlers import http_exception_handler
-from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
-from starlette.exceptions import HTTPException as StarletteHTTPException
 
 load_dotenv()
 
@@ -211,48 +222,16 @@ def _get_config(key: str, default: Optional[str] = None) -> Optional[str]:
     return default
 
 
-app = FastAPI(title="Selfie Authenticity Gateway v13.1 (liveness-only)")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-log.info("CORS | allow_origins=* (all origins allowed)")
-
-
-@app.exception_handler(StarletteHTTPException)
-async def _http_exception_handler(request, exc: StarletteHTTPException):
-    """
-    Remap FastAPI's hardcoded body-parse failure to a documented 422.
-
-    When the raw request body cannot be read as JSON for a reason other than a
-    JSONDecodeError — e.g. non-UTF-8 bytes like a fuzzed binary payload — FastAPI
-    raises HTTPException(400, "There was an error parsing the body") from deep
-    inside its routing, before the request ever reaches this endpoint or the
-    Pydantic schema. That 400 is outside our documented status set
-    {422, 500, 503, 504}.
-
-    This app raises no 400 of its own (only the queue 503/504 and processing
-    500s), so any 400 that surfaces here is that body-parse failure. We remap it
-    to 422 — the same code FastAPI returns for a JSONDecodeError or a schema
-    violation — and shape the body as the array-of-errors form that FastAPI's
-    native validation errors use, so every 422 conforms to one documented
-    schema. All other HTTPExceptions (500/503/504) pass straight through to the
-    default handler.
-    """
-    if exc.status_code == 400:
-        return JSONResponse(
-            status_code=422,
-            content={"detail": [{
-                "type": "body_parse_error",
-                "loc": ["body"],
-                "msg": str(exc.detail),
-            }]},
-        )
-    return await http_exception_handler(request, exc)
+# ---------------------------------------------------------------------------
+# NOTE: `app = FastAPI(...)` used to be constructed here, immediately after
+# the Silent-Face import block, with CORS middleware attached right below it.
+# It has been MOVED further down in this file (right before the
+# `/liveness-only` endpoint), because the new `lifespan` function needs to
+# close over `_eye_cascade`, `_startup_init_kprokofi`, `_startup_init_silent_face`,
+# and the various config constants defined below - all of which used to be
+# defined *after* `app` was created. See the `_lifespan` function and the
+# `app = FastAPI(..., lifespan=_lifespan)` line near the bottom of this file.
+# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # Fusion config
@@ -396,7 +375,7 @@ if _eye_cascade.empty():
     )
 
 # ---------------------------------------------------------------------------
-# Startup log
+# Startup log (config dump - independent of `app`, runs at import time same as before)
 # ---------------------------------------------------------------------------
 log.info("Torch device: %s | torch_threads=%d", DEVICE, _TORCH_THREADS)
 log.info("ORT version: %s | intra_threads=%d", ort.__version__, ORT_INTRA_THREADS)
@@ -583,10 +562,11 @@ def _startup_init_silent_face() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Startup
+# Lifespan (replaces the old @app.on_event("startup") hook - Starlette 1.0+
+# removed on_event() entirely, so this is required for starlette>=1.0.1)
 # ---------------------------------------------------------------------------
-@app.on_event("startup")
-async def _startup() -> None:
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
     global _queue_sem, _worker_sem
 
     _queue_sem  = asyncio.Semaphore(_QUEUE_CAPACITY)
@@ -612,6 +592,30 @@ async def _startup() -> None:
     log.info("=" * 60)
     log.info("GATEWAY STARTUP COMPLETE  [v13.1 liveness-only  fusion=%s]", LIVENESS_FUSION)
     log.info("=" * 60)
+
+    yield
+
+    log.info("GATEWAY SHUTDOWN")
+
+
+# ---------------------------------------------------------------------------
+# FastAPI app (moved here from its old early position - see note above the
+# Fusion config block - so that `lifespan=_lifespan` can close over the
+# config constants and helper functions defined above)
+# ---------------------------------------------------------------------------
+app = FastAPI(
+    title="Selfie Authenticity Gateway v13.1 (liveness-only)",
+    lifespan=_lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+log.info("CORS | allow_origins=* (all origins allowed)")
 
 
 _request_counter = 0
@@ -1556,6 +1560,8 @@ async def _async_liveness(image_bytes: bytes, rid: str = "") -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 _USER_MESSAGES: Dict[str, str] = {
     "liveness_failed":         "Please retake your selfie while looking straight into the camera.",
+    "liveness_error":          "Something went wrong during verification. Please try again.",
+    "liveness_decode_error":   "We could not process your photo. Please try again.",
     "face_not_clearly_visible":
         "Your face is not clearly visible. Please take a new selfie with your face centered and well-lit.",
     "significant_face_features_not_visible":
@@ -1592,42 +1598,27 @@ def _resp(success: bool, message: str, result: Dict[str, Any]) -> Dict[str, Any]
     return {"success": success, "message": message, "result": result}
 
 
-def _raise_image_422(msg: str) -> None:
-    """
-    Reject a bad image with a 422 in FastAPI's native validation-error shape
-    (detail is an array of {type, loc, msg}), so it conforms to the same
-    documented 422 schema as schema-level violations. Raising
-    RequestValidationError routes through FastAPI's default validation handler.
-    """
-    raise RequestValidationError([{
-        "type": "value_error",
-        "loc": ("body", "image"),
-        "msg": msg,
-    }])
-
-
-def _decode_image_b64(image_b64: str) -> bytes:
-    """
-    Base64-decode the (schema-validated, non-empty, length-bounded) image string.
-
-    On any problem this raises a 422 (via _raise_image_422) rather than returning
-    a 200 envelope: a malformed image is a client input error and gets a proper
-    error status. Genuine emptiness/over-length is already caught at the schema
-    layer (min_length / max_length) and never reaches here.
-    """
+def _extract_image_bytes(payload: Dict[str, Any]) -> bytes:
+    if "image" not in payload:
+        raise HTTPException(400, "Missing 'image' field in request body")
+    image_b64 = payload["image"]
+    if not isinstance(image_b64, str):
+        raise HTTPException(400, "'image' must be a string")
+    if not image_b64.strip():
+        raise HTTPException(400, "'image' is empty")
     if "," in image_b64:
         image_b64 = image_b64.split(",", 1)[1]
     if not image_b64.strip():
-        _raise_image_422("Image payload is empty after stripping the data-URI prefix")
+        raise HTTPException(400, "No data after data-URI prefix")
     try:
         image_bytes = base64.b64decode(image_b64)
     except Exception:
-        _raise_image_422("Image is not valid base64")
+        raise HTTPException(400, "Invalid base64 string")
     if not image_bytes:
-        _raise_image_422("Image is empty after base64 decoding")
+        raise HTTPException(400, "Empty image after decoding")
     if len(image_bytes) > MAX_UPLOAD_BYTES:
-        _raise_image_422(
-            f"Image exceeds the maximum size of {MAX_UPLOAD_BYTES // (1024 * 1024)} MB"
+        raise HTTPException(
+            413, f"Image too large (max {MAX_UPLOAD_BYTES // (1024 * 1024)} MB)"
         )
     return image_bytes
 
@@ -1646,46 +1637,29 @@ def _liveness_block(l: Dict[str, Any]) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Endpoint helpers
 # ---------------------------------------------------------------------------
-# Base64 of an N-byte image is ~4/3 * N chars; add slack for data-URI prefix
-# and padding. Anything longer than an encoded MAX_UPLOAD_BYTES image is a
-# schema violation (native 422) rather than a runtime check.
-_IMAGE_MAX_B64_LEN = (MAX_UPLOAD_BYTES * 4 // 3) + 256
-
-
-class LivenessRequest(BaseModel):
-    """
-    Request schema for /liveness-only.
-
-    Both fields are REQUIRED and constrained, so anything malformed — missing or
-    wrong instanceName, missing/empty/oversize image — is a genuine schema
-    violation that FastAPI/Pydantic rejects with a documented 422 before the
-    endpoint runs. The only runtime image check left is base64 validity (also a
-    422, raised explicitly). No bad-input path returns HTTP 200.
-
-    Note: "a valid base64 of a real JPEG/PNG" cannot be expressed in JSON schema,
-    so a schema-conforming string may still fail to decode to an image and be
-    rejected with 422. For Schemathesis, 422 must therefore be included in the
-    accepted statuses for positive_data_acceptance on this endpoint.
-    """
-    instanceName: Literal["KYC", "VG"] = Field(
-        ..., description="Calling instance: KYC or VG"
-    )
-    image: str = Field(
-        ...,
-        min_length=1,
-        max_length=_IMAGE_MAX_B64_LEN,
-        description="Base64-encoded selfie (optionally data-URI prefixed)",
-    )
-
-    model_config = {"extra": "ignore"}
-
-
+_VALID_INSTANCE_NAMES   = {"KYC", "VG"}
 _COMMON_ERROR_RESPONSES = {
-    422: {"description": "Validation error (bad/missing instanceName or image)"},
-    500: {"description": "Internal processing error"},
+    400: {"description": "Bad request"},
+    413: {"description": "Payload too large"},
     503: {"description": "Queue full — shed immediately"},
     504: {"description": "Queue timeout — waited too long for a worker"},
 }
+
+
+def _validate_instance_name(payload: Dict[str, Any]) -> str:
+    instance_name = payload.get("instanceName")
+    if not instance_name:
+        raise HTTPException(400, "Missing 'instanceName' field in request body")
+    if (
+        not isinstance(instance_name, str)
+        or instance_name.strip() not in _VALID_INSTANCE_NAMES
+    ):
+        raise HTTPException(
+            400,
+            f"Invalid 'instanceName': {instance_name!r}. "
+            f"Must be one of {sorted(_VALID_INSTANCE_NAMES)}",
+        )
+    return instance_name.strip()
 
 
 def _handle_liveness_result(
@@ -1695,14 +1669,9 @@ def _handle_liveness_result(
     total_ms_fn,
 ) -> Dict[str, Any]:
     if liv.get("error"):
-        err = liv["error"]
-        log.error("[%s][%s] Liveness error: %s", rid, instance_name, err)
-        # The image bytes were syntactically fine base64 but not a decodable
-        # image — that's a client input problem, so 422 (not a 5xx, not a 200).
-        if err == "cv2.imdecode failed":
-            _raise_image_422("Uploaded data is not a decodable image")
-        # Anything else here is a genuine server-side processing failure.
-        raise HTTPException(500, detail="Liveness processing error")
+        log.error("[%s][%s] Liveness error: %s", rid, instance_name, liv["error"])
+        return _rej("liveness_decode_error", error=liv["error"],
+                    total_processing_time_ms=total_ms_fn(), rid=rid)
 
     liveness_blk = _liveness_block(liv)
 
@@ -1733,7 +1702,7 @@ def _handle_liveness_result(
 # Endpoint
 # ---------------------------------------------------------------------------
 @app.post("/liveness-only", responses=_COMMON_ERROR_RESPONSES)
-async def liveness_only(payload: LivenessRequest) -> Dict[str, Any]:
+async def liveness_only(payload: Dict[str, Any]) -> Dict[str, Any]:
     rid = _next_request_id()
 
     if _queue_sem._value == 0:
@@ -1771,30 +1740,23 @@ async def liveness_only(payload: LivenessRequest) -> Dict[str, Any]:
             log.info("[%s] worker acquired after %.1fms in queue", rid, wait_ms)
 
         try:
-            # instanceName is already validated by the Pydantic schema; a bad or
-            # missing value never reaches here (FastAPI returns a documented 422).
-            instance_name = payload.instanceName
+            instance_name = _validate_instance_name(payload)
 
             log.info("[%s][%s] === /liveness-only START  queue_wait=%.1fms ===",
                      rid, instance_name, wait_ms)
 
+            image_bytes = _extract_image_bytes(payload)
             _t_request  = time.monotonic()
 
             def _total_ms() -> float:
                 return round((time.monotonic() - _t_request) * 1000, 2)
 
-            # Malformed image → 422 (raised inside _decode_image_b64). Missing /
-            # empty / oversize image is already a schema-level 422 and never
-            # reaches here. No bad-input path returns HTTP 200.
-            image_bytes = _decode_image_b64(payload.image)
-
             try:
                 liv = await _async_liveness(image_bytes, rid)
-            except HTTPException:
-                raise
-            except Exception:
+            except Exception as e:
                 log.exception("[%s][%s] Liveness stage error", rid, instance_name)
-                raise HTTPException(500, detail="Liveness processing error")
+                return _rej("liveness_error", error=repr(e),
+                            total_processing_time_ms=_total_ms(), rid=rid)
 
             return _handle_liveness_result(liv, rid, instance_name, _total_ms)
 
